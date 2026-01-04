@@ -1,10 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 import joblib
 import csv
 from datetime import datetime
 import requests
 import hashlib
+from pypdf import PdfReader
+import io
+from PIL import Image, ExifTags
 
 app = FastAPI()
 
@@ -17,6 +20,16 @@ def log_threat(content, status, threat_type):
         writer = csv.writer(f)
         # Columns: Timestamp, Content Checked, Status, Threat Type
         writer.writerow([datetime.now().strftime("%H:%M:%S"), content[:30], status, threat_type])
+
+# Helper function to convert GPS coordinates to degrees
+def get_decimal_from_dms(dms, ref):
+    degrees = dms[0]
+    minutes = dms[1]
+    seconds = dms[2]
+    decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+    if ref in ['S', 'W']:
+        decimal = -decimal
+    return decimal
 
 # Define Data Structure
 class TextData(BaseModel):
@@ -138,3 +151,103 @@ def scan_url_endpoint(data: TextData):
     except Exception as e:
         log_threat(f"URL: {target_url[:30]}...", "ERROR", "URL Scan Failed")
         return {"status": "ERROR", "message": f"Could not access link: {str(e)}"}
+
+# --- FEATURE 4: SCAN PDF FILES ---
+@app.post("/scan-pdf")
+async def scan_pdf(file: UploadFile = File(...)):
+    try:
+        # 1. Read the file into memory
+        contents = await file.read()
+        pdf_file = io.BytesIO(contents)
+        
+        # 2. Extract Text from PDF
+        reader = PdfReader(pdf_file)
+        extracted_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                extracted_text += text + " "
+        
+        # 3. If PDF is empty (scanned image), warn user
+        if len(extracted_text.strip()) < 5:
+            return {
+                "status": "WARNING", 
+                "message": "No text found. This might be an image-only PDF (requires OCR)."
+            }
+
+        # 4. Use your existing AI Model to check the text
+        # (We reuse the predict_phishing function you already have!)
+        prediction = model.predict([extracted_text])[0]
+        probability = model.predict_proba([extracted_text])[0][1] * 100
+        
+        if prediction == 1:
+            log_threat(f"PDF: {file.filename[:30]}...", "DANGER", "Phishing PDF")
+            return {
+                "status": "DANGER", 
+                "message": f"Malicious Content Detected in PDF.\nConfidence: {probability:.1f}%"
+            }
+        else:
+            log_threat(f"PDF: {file.filename[:30]}...", "SAFE", "Clean PDF")
+            return {
+                "status": "SAFE", 
+                "message": "PDF Content Analysis: Clean."
+            }
+
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Failed to parse PDF: {str(e)}"}
+
+# --- FEATURE 5: IMAGE FORENSICS (Privacy Threat Detection) ---
+@app.post("/scan-image-forensics")
+async def scan_image_forensics(file: UploadFile = File(...)):
+    try:
+        # 1. Open Image
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data))
+        
+        # 2. Extract EXIF Data (Metadata)
+        exif_data = image._getexif()
+        result = {
+            "status": "SAFE",
+            "message": "No hidden metadata found.",
+            "device": "Unknown",
+            "location": None
+        }
+
+        if not exif_data:
+            return result
+
+        # 3. Analyze Tags
+        threat_level = "SAFE"
+        warnings = []
+        
+        for tag, value in exif_data.items():
+            tag_name = ExifTags.TAGS.get(tag, tag)
+            
+            # Check for Camera Model (Privacy Leak)
+            if tag_name == 'Model':
+                result['device'] = str(value)
+                warnings.append(f"Device Model Exposed: {value}")
+
+            # Check for GPS Info (Major Privacy Threat)
+            if tag_name == 'GPSInfo':
+                threat_level = "PRIVACY_RISK"
+                warnings.append("⚠️ GPS GEOLOCATION FOUND! Your exact location is embedded in this file.")
+                
+                # (Optional) Attempt to parse coordinates here
+                result['location'] = "Embedded"
+
+        if threat_level == "PRIVACY_RISK":
+            result['status'] = "DANGER"
+            result['message'] = "\n".join(warnings)
+            log_threat(f"Image: {file.filename[:30]}...", "DANGER", "Privacy Risk - GPS")
+        elif warnings:
+            result['status'] = "WARNING"
+            result['message'] = "\n".join(warnings)
+            log_threat(f"Image: {file.filename[:30]}...", "WARNING", "Privacy Risk - Metadata")
+        else:
+            log_threat(f"Image: {file.filename[:30]}...", "SAFE", "No Privacy Threats")
+
+        return result
+
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Forensics failed: {str(e)}"}

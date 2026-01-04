@@ -5,3 +5,5 @@ pandas
 joblib
 requests
 python-multipart
+pypdf
+Pillow
